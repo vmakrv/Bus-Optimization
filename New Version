@@ -1,0 +1,89 @@
+#Import Libraries
+from pyomo.environ import *
+import pandas as pd
+
+#Load Data
+demand_df = pd.read_csv("Demand.csv")
+loop_df = pd.read_csv("Loop_Times.csv", index_col="route_id")
+stc_df = pd.read_csv("RouteServesSTC.csv", index_col="route_id")
+train_df = pd.read_csv("TrainSchedule.csv")
+
+#Sets
+B = range(40)  # buses
+R = list(loop_df.index)  # routes
+T = list(demand_df["time_block"])
+
+
+#Parameters
+tau = 120
+cost_A = 1.0
+alpha = 0.5
+beta = 1.0
+delta = 0.01
+C_r = 50
+
+
+#Model
+model = ConcreteModel()
+model.B = Set(initialize=B)
+model.R = Set(initialize=R)
+model.T = Set(initialize=T)
+model.x = Var(model.B, model.R, model.T, domain=Binary)
+model.y = Var(model.B, domain=Binary)
+
+
+#Decision Variables
+def demand(r, t):
+    return demand_df.loc[demand_df["time_block"] == t, r].values[0]
+
+def loop_time(r, t):
+    return loop_df.loc[r, t]
+
+def serves_stc(r):
+    return stc_df.loc[r, "serves_stc"]
+
+train_windows = set(train_df["time_block"])
+
+
+#Constraints
+def assign_limit_rule(model, b, t):
+    return sum(model.x[b, r, t] for r in model.R) <= 1
+model.AssignLimit = Constraint(model.B, model.T, rule=assign_limit_rule)
+
+def demand_coverage_rule(model, r, t):
+    return sum(model.x[b, r, t] * (C_r * tau / loop_time(r, t)) for b in model.B) >= demand(r, t)
+model.DemandCoverage = Constraint(model.R, model.T, rule=demand_coverage_rule)
+
+def activation_rule(model, b, r, t):
+    return model.x[b, r, t] <= model.y[b]
+model.Activation = Constraint(model.B, model.R, model.T, rule=activation_rule)
+
+def stc_alignment_rule(model, t):
+    if t in train_windows:
+        return sum(model.x[b, r, t] * serves_stc(r) for b in model.B for r in model.R) >= 1
+    return Constraint.Skip
+model.STCAlignment = Constraint(model.T, rule=stc_alignment_rule)
+
+
+#Objective
+def objective_rule(model):
+    activation_cost = sum(model.y[b] * cost_A for b in model.B)
+    busyness_reward = sum(
+        beta * demand(r, t) / (sum(model.x[b, r, t] for b in model.B) + delta)
+        for r in model.R for t in model.T)
+    return alpha * activation_cost - (1 - alpha) * busyness_reward
+model.Objective = Objective(rule=objective_rule, sense=minimize)
+
+
+#Solve
+solver = SolverFactory("ipopt")
+results = solver.solve(model, tee=True)
+
+
+#Output
+for b in model.B:
+    schedule = []
+    for t in model.T:
+        assigned = [r for r in model.R if model.x[b, r, t].value == 1]
+        schedule.append(assigned[0] if assigned else "Idle")
+    print(f"Bus {b + 1}: " + " → ".join(map(str, schedule)))

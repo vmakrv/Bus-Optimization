@@ -1,0 +1,203 @@
+!pip install ortools
+
+#Import Libraries
+import pandas as pd
+import numpy as np
+import math
+from ortools.linear_solver import pywraplp
+
+
+#Load Data
+from google.colab import files
+uploaded = files.upload()
+
+
+#Clean Demand Data
+demand_df = pd.read_csv("2-11-N.csv", header=0, index_col=0)
+demand_df = demand_df.dropna(axis=1, how='all')
+demand = demand_df.values.T
+
+
+#Clean Cost Matrix
+cost_df = pd.read_csv("cost_north.csv", index_col=0)
+cost_df = cost_df.dropna(axis=1, how='all')
+cost_matrix = cost_df.astype(float).values
+
+
+#Clean Loop Times
+loop_df = pd.read_csv("loop_times_north.csv", index_col=0)
+loop_df = loop_df.dropna(axis=1, how='all')
+loop_df = loop_df.astype(float)
+loop_df.fillna(60, inplace=True)
+loop_df[loop_df > 120] = 120
+loop_time = loop_df.values
+average_loop = np.nanmean(loop_time)
+
+
+#Dimensions
+R, T = demand.shape
+print("Demand shape:", demand.shape)
+print("Loop time shape:", loop_time.shape)
+
+
+#Parameters
+B = 10
+tau = 120
+cost_A = 1.0
+alpha = 0.5
+cost_weight = 1.0
+capacity = [50] * R
+
+
+#Create Solver
+solver = pywraplp.Solver.CreateSolver("SCIP")
+
+
+#Decision Variables
+x, y, z, U = {}, {}, {}, {}
+
+for b in range(B):
+    y[b] = solver.BoolVar(f"y_{b}")
+    for t in range(T):
+        U[b, t] = solver.BoolVar(f"U_{b}_{t}")
+        for r in range(R):
+            x[b, r, t] = solver.BoolVar(f"x_{b}_{r}_{t}")
+        if t < T - 1:
+            for i in range(R):
+                for j in range(R):
+                    z[b, i, j, t] = solver.BoolVar(f"z_{b}_{i}_{j}_{t}")
+
+
+#Constraints
+for b in range(B):
+    for t in range(T):
+        solver.Add(solver.Sum(x[b, r, t] for r in range(R)) <= 1)
+
+for r in range(R):
+    for t in range(T):
+        if demand[r][t] > 0:
+            effective_capacity = capacity[r] * (tau / loop_time[r][t])
+            coverage = solver.Sum(x[b, r, t] * effective_capacity for b in range(B))
+            solver.Add(coverage >= demand[r][t])
+
+for b in range(B):
+    for r in range(R):
+        for t in range(T):
+            solver.Add(x[b, r, t] <= y[b])
+
+for b in range(B):
+    for t in range(T - 1):
+        for i in range(R):
+            for j in range(R):
+                solver.Add(z[b, i, j, t] <= x[b, i, t])
+                solver.Add(z[b, i, j, t] <= x[b, j, t + 1])
+                solver.Add(z[b, i, j, t] >= x[b, i, t] + x[b, j, t + 1] - 1)
+
+for b in range(B):
+    for t in range(T):
+        solver.Add(U[b, t] == solver.Sum(x[b, r, t] for r in range(R)))
+
+
+#Objective Function
+objective = solver.Objective()
+
+for b in range(B):
+    objective.SetCoefficient(y[b], alpha * cost_A)
+
+for b in range(B):
+    for r in range(R):
+        for t in range(T):
+            if demand[r][t] > 0:
+                wait_penalty = loop_time[r][t] * (1 - alpha)
+                objective.SetCoefficient(x[b, r, t], wait_penalty)
+
+for b in range(B):
+    for t in range(T - 1):
+        for i in range(R):
+            for j in range(R):
+                objective.SetCoefficient(z[b, i, j, t], cost_matrix[i][j] * cost_weight)
+
+objective.SetMinimization()
+
+
+#Solve
+status = solver.Solve()
+
+
+#Output
+if status == solver.OPTIMAL:
+    print("Optimal Solution Found\n")
+
+    total_activation_cost = sum(cost_A * y[b].solution_value() for b in range(B))
+    total_transfer_cost = sum(
+        cost_matrix[i][j] * cost_weight * z[b, i, j, t].solution_value()
+        for b in range(B)
+        for t in range(T - 1)
+        for i in range(R)
+        for j in range(R)
+    )
+
+    for t in range(T):
+        used = sum(U[b, t].solution_value() for b in range(B))
+        idle = B - int(used)
+        print(f"Time Block {t}: Used Buses = {int(used)}, Idle Buses = {idle}")
+        for r in range(R):
+            assigned = sum(x[b, r, t].solution_value() for b in range(B))
+            print(f"  Route {r}: Demand = {demand[r][t]}, Buses Assigned = {int(assigned)}")
+        print()
+
+    transfer_penalty = 0
+    transfer_flags = {}
+    route_idle_route_flags = {}
+
+    print("\nBus Progressions:\n")
+
+    for b in range(B):
+        progression = []
+        for t in range(T):
+            assigned_route = None
+            for r in range(R):
+                if x[b, r, t].solution_value() > 0.5:
+                    assigned_route = r
+                    break
+            if assigned_route is not None:
+                progression.append(f"Route {assigned_route}")
+            else:
+                progression.append("Idle")
+        print(f"Bus {b + 1}: " + ", ".join(progression))
+
+        for t in range(T - 1):
+            current = progression[t]
+            next_ = progression[t + 1]
+            if current != "Idle" and next_ != "Idle" and current != next_:
+                from_r = int(current.split()[1])
+                to_r = int(next_.split()[1])
+                penalty = cost_matrix[from_r][to_r] * cost_weight
+                transfer_penalty += penalty
+                transfer_flags[(b, t)] = (from_r, to_r)
+
+        for t in range(T - 2):
+            first = progression[t]
+            middle = progression[t + 1]
+            last = progression[t + 2]
+            if first != "Idle" and middle == "Idle" and last != "Idle" and first != last:
+                from_r = int(first.split()[1])
+                to_r = int(last.split()[1])
+                route_idle_route_flags[(b, t)] = (from_r, to_r)
+
+    print("\nDetected Transfers (excluding idle):\n")
+    for (b, t), (from_r, to_r) in transfer_flags.items():
+        print(f"Bus {b + 1} transfers at t={t}: Route {from_r} → Route {to_r}")
+
+    print("\nRoute → Idle → Route Transitions:\n")
+    for (b, t), (from_r, to_r) in route_idle_route_flags.items():
+        print(f"Bus {b + 1} idles at t={t+1} between Route {from_r} → Route {to_r}")
+
+    print(f"\nObjective Value: {objective.Value():.2f}")
+    print(f"  Activation Cost: {total_activation_cost:.2f}")
+    print(f"  Transfer Cost (z-based): {total_transfer_cost:.2f}")
+    print(f"  Transfer Penalty (route changes only): {transfer_penalty:.2f}")
+    print(f"  Total Cost (with penalty): {objective.Value() + transfer_penalty:.2f}")
+
+else:
+    print("No feasible solution found")
